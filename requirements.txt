@@ -1,0 +1,13 @@
+pandas
+numpy
+matplotlib
+scikit-learn 
+openpyxl
+xgboost
+tensorflow
+streamlit
+seaborn
+plotly
+xgboost==2.0.3
+dash-bootstrap-components
+dash
