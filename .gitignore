@@ -1,11 +1,9 @@
 # Ignore everything by default
 *
 
-# But keep only these:
-!data/
-!models/
+# Keep these files/folders (and all their contents)
+!.gitignore
 !app.py
 !requirements.txt
-
-# Also keep hidden files like .gitignore
-!.gitignore
+!data/**
+!models/**
