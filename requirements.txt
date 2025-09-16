@@ -11,3 +11,7 @@ plotly
 xgboost==2.0.3
 dash-bootstrap-components
 dash
+panel
+flask
+folium
+branca
