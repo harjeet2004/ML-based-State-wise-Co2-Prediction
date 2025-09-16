@@ -5,66 +5,96 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import streamlit as st
-import plotly.express as px
-import plotly.graph_objects as go
+import plotly.graph_objects as go  # for charts
+
+import folium
+from folium.features import GeoJsonTooltip, GeoJsonPopup
+import branca.colormap as cm
+from streamlit.components.v1 import html as st_html  # embed HTML so map interactions don't trigger reruns
 
 MODELDIR = Path("models")
 DATADIR  = Path("data")
+GEOJSON_FILENAME = "india_state.geojson"  # your GADM-like file (NAME_1)
 
 # ---------- Cached data loader ----------
 @st.cache_data(show_spinner=False)
 def load_raw_df():
-    """Load the wide-format dataset once and cache it."""
     df = pd.read_csv(DATADIR / "compiled_clean_data.csv")
-    # normalize STATE just in case
     if "STATE" in df.columns:
-        df["STATE"] = df["STATE"].astype(str).str.strip().str.upper()
+        df["STATE"] = (
+            df["STATE"].astype(str).str.strip().str.upper()
+              .str.replace("&", "AND", regex=False)
+              .str.replace(r"\s+", " ", regex=True)
+        )
     return df
 
 raw_df = load_raw_df()
 
-# ---------- GeoJSON (cached): build an exact-case mapper ----------
+# ---------- GeoJSON (auto-detect name field; build synonym map) ----------
 @st.cache_data(show_spinner=False)
 def load_india_geojson_and_mapper():
-    with open(DATADIR / "india_state.geojson", "r", encoding="utf-8") as f:
+    with open(DATADIR / GEOJSON_FILENAME, "r", encoding="utf-8") as f:
         gj = json.load(f)
 
-    # NAME_1 values in the geojson are Title/Proper case (e.g., "Andhra Pradesh")
-    # Build a mapping: UPPER -> exact case from geojson
+    cand_fields = ["NAME_1", "st_nm", "STATE", "STATE_NAME", "name"]
+    sample_props = (gj.get("features") or [{}])[0].get("properties", {})
+    name_field = next((f for f in cand_fields if f in sample_props), None)
+    if not name_field:
+        raise ValueError("Could not find a state-name property in GeoJSON (tried NAME_1, st_nm, STATE, STATE_NAME, name).")
+
+    # UPPER -> exact case map; include VARNAME_1 synonyms if available
     name_case_map = {}
     for feat in gj.get("features", []):
-        name_exact = str(feat.get("properties", {}).get("NAME_1", "")).strip()
-        if name_exact:
-            name_case_map[name_exact.upper()] = name_exact
-    return gj, name_case_map
+        props = feat.get("properties", {}) or {}
+        base = str(props.get(name_field, "")).strip()
+        if not base:
+            continue
+        name_case_map[base.upper().replace("&", "AND")] = base
+        varalts = str(props.get("VARNAME_1", "") or "")
+        if varalts:
+            for alt in varalts.split("|"):
+                alt = alt.strip()
+                if alt:
+                    name_case_map[alt.upper().replace("&", "AND")] = base
+    return gj, name_field, name_case_map
 
-gj, NAME_CASE_MAP = load_india_geojson_and_mapper()
+gj, NAME_FIELD, NAME_CASE_MAP = load_india_geojson_and_mapper()
 
-# handle legacy / alternate spellings in the CSV/model vs geojson
+# ---------- Aliases to reconcile CSV ↔ GeoJSON ----------
 ALIASES = {
-    "ORISSA": "ODISHA",
-    "UTTARANCHAL": "UTTARAKHAND",
+    # Modern → older/GADM spelling or what your file contains
+    "ODISHA": "ORISSA",
+    "UTTARAKHAND": "UTTARANCHAL",
     "PONDICHERRY": "PUDUCHERRY",
-    "JAMMU & KASHMIR": "JAMMU AND KASHMIR",
+    "PUDUCHERRY": "PUDUCHERRY",
+    "DELHI (NCT)": "DELHI",
+    "NCT OF DELHI": "DELHI",
+    "ANDAMAN AND NICOBAR ISLANDS": "ANDAMAN AND NICOBAR",
+    "ANDAMAN & NICOBAR ISLANDS": "ANDAMAN AND NICOBAR",
     "JAMMU AND KASHMIR (UT)": "JAMMU AND KASHMIR",
+    "JAMMU & KASHMIR": "JAMMU AND KASHMIR",
+    # UT merge variants (fallback to one present in older files)
+    "DADRA AND NAGAR HAVELI AND DAMAN AND DIU": "DADRA AND NAGAR HAVELI",
+    "DADRA & NAGAR HAVELI AND DAMAN & DIU": "DADRA AND NAGAR HAVELI",
+    # Telangana missing in many old files → map to AP polygon (explicit)
+    "TELANGANA": "ANDHRA PRADESH",
 }
 
 def to_gj_exact_case(state_upper: str) -> str | None:
-    """Return the NAME_1 string exactly as in the GeoJSON (case-sensitive)."""
+    """Normalize CSV STATE to the GeoJSON naming and return exact-case string from GeoJSON."""
     s = state_upper.strip().upper().replace("&", "AND")
-    s = ALIASES.get(s, s)
     s = " ".join(s.split())
+    s = ALIASES.get(s, s)
     return NAME_CASE_MAP.get(s)  # None if not found
 
-# ---------- Cached helpers ----------
+# ---------- Model & helpers ----------
 @st.cache_resource(show_spinner=False)
 def load_bundle(which: str):
-    """Load model/encoder/feature order for the chosen algorithm (cached)."""
     if which == "XGBoost":
         model   = pickle.load(open(MODELDIR / "xgb_full_model.pkl", "rb"))
         encoder = pickle.load(open(MODELDIR / "xgb_state_ohe.pkl",  "rb"))
         featord = pickle.load(open(MODELDIR / "xgb_feature_order.pkl", "rb"))
-    else:  # RandomForest
+    else:
         model   = pickle.load(open(MODELDIR / "rf_full_model.pkl",  "rb"))
         encoder = pickle.load(open(MODELDIR / "rf_state_ohe.pkl",   "rb"))
         featord = pickle.load(open(MODELDIR / "rf_feature_order.pkl", "rb"))
@@ -76,20 +106,17 @@ def make_X(state: str, year: int, encoder, feat_ord):
 
 @st.cache_data(show_spinner=False)
 def hist(df: pd.DataFrame, series_prefix: str, state: str):
-    """Cached history extractor for 2005–2018."""
     return [
         df.loc[df.STATE.eq(state), f"{series_prefix}_{y}"].values[0]
         if f"{series_prefix}_{y}" in df.columns else np.nan
         for y in range(2005, 2019)
     ]
 
-# ---- Trends for fallback (cached) ----
 YEARS = list(range(2005, 2019))
 states = sorted(raw_df["STATE"].unique().tolist())
 
 @st.cache_data(show_spinner=False)
 def compute_trends(df: pd.DataFrame, states_list, years_list):
-    """Build per-state linear trends for IIP/AFOLU/WASTE/VEHICLE."""
     def build_trend(prefix):
         trends = {}
         for s in states_list:
@@ -101,28 +128,25 @@ def compute_trends(df: pd.DataFrame, states_list, years_list):
                     if pd.notna(v):
                         xs.append(y); ys.append(float(v))
             if len(xs) >= 2:
-                m, b = np.polyfit(xs, ys, 1)  # y = m*year + b
+                m, b = np.polyfit(xs, ys, 1)
                 trends[s] = (m, b)
         return trends
-
     return {
-        "IIP":      build_trend("IIP"),
-        "AFOLU":    build_trend("AFOLU"),
-        "WASTE":    build_trend("WASTE"),
-        "VEHICLE":  build_trend("VEHICLE"),
+        "IIP": build_trend("IIP"),
+        "AFOLU": build_trend("AFOLU"),
+        "WASTE": build_trend("WASTE"),
+        "VEHICLE": build_trend("VEHICLE"),
     }
 
 TREND = compute_trends(raw_df, states, YEARS)
 
 def trend_predict(state, year, name):
     m_b = TREND[name].get(state)
-    if m_b is None:
-        return None
+    if m_b is None: return None
     m, b = m_b
     return m * year + b
 
 def predict_with_fallback(state: str, year: int, model, encoder, feat_ord):
-    """Use chosen model inside 2005–2018; linear-trend fallback outside."""
     in_range = 2005 <= year <= 2018
     iip, afolu, waste, veh, pop, nsdp = model.predict(make_X(state, year, encoder, feat_ord))[0]
     if not in_range:
@@ -140,6 +164,107 @@ def fmt(x, mt=False, decimals=2):
     scale = 1e6 if mt else 1.0
     return f"{(x/scale):,.{decimals}f}"
 
+# ---------- Folium builder (AGGREGATES duplicates to ensure unique index) ----------
+def build_folium_map(df_pred: pd.DataFrame, unit_label: str, mt: bool):
+    """
+    df_pred columns needed:
+      - GJ_NAME_EXACT (matches geojson properties[NAME_FIELD])
+      - STATE, IIP, AFOLU, WASTE, VEHICLE_COUNT, TOTAL_POPULATION, NSDP_2024_25, NET
+    """
+    if df_pred.empty:
+        return None
+
+    # Aggregate duplicates so index is unique (e.g., TELANGANA merged into AP)
+    agg = {
+        "IIP": "sum",
+        "AFOLU": "sum",
+        "WASTE": "sum",
+        "VEHICLE_COUNT": "sum",
+        "TOTAL_POPULATION": "sum",
+        "NSDP_2024_25": "sum",
+        "NET": "sum",
+    }
+    df_agg = (
+        df_pred.groupby("GJ_NAME_EXACT", as_index=False)
+               .agg({**agg, "STATE": lambda s: ", ".join(sorted(set(s)))})
+    )
+
+    df_agg["NET_DISPLAY"] = df_agg["NET"] / (1e6 if mt else 1.0)
+    vmin, vmax = float(df_agg["NET_DISPLAY"].min()), float(df_agg["NET_DISPLAY"].max())
+    if vmin == vmax:
+        vmin, vmax = 0.0, max(1.0, vmax)
+
+    # Tidy stepped legend
+    steps = list(np.linspace(vmin, vmax, 5))
+    colormap = cm.linear.YlOrRd_09.scale(vmin, vmax).to_step(index=steps)
+    colormap.caption = f"Net emissions ({'MtCO₂e' if mt else 'tCO₂e'})"
+
+    # Unique lookup by matched geojson name
+    lookup = df_agg.set_index("GJ_NAME_EXACT").to_dict(orient="index")
+
+    # Build augmented GeoJSON
+    gj_aug = {"type": "FeatureCollection", "features": []}
+    for feat in gj.get("features", []):
+        props = dict(feat.get("properties", {}) or {})
+        name = props.get(NAME_FIELD)
+        row  = lookup.get(name)
+        if row is None:
+            continue
+        props.update({
+            "STATE_CSV": row["STATE"],  # shows CSV names merged into this polygon
+            "NET_DISPLAY": float(row["NET_DISPLAY"]),
+            "IIP": float(row["IIP"]),
+            "AFOLU": float(row["AFOLU"]),
+            "WASTE": float(row["WASTE"]),
+            "VEHICLE_COUNT": int(row["VEHICLE_COUNT"]),
+            "TOTAL_POPULATION": int(row["TOTAL_POPULATION"]),
+            "NSDP_2024_25": float(row["NSDP_2024_25"]),
+        })
+        gj_aug["features"].append({
+            "type": "Feature",
+            "geometry": feat["geometry"],
+            "properties": props,
+        })
+
+    m = folium.Map(location=[22.8, 79], zoom_start=4.5,
+                   tiles="CartoDB positron", control_scale=True)
+
+    def style_fn(feature):
+        val = feature["properties"].get("NET_DISPLAY")
+        return {
+            "fillColor": colormap(val) if val is not None else "#f0f0f0",
+            "color": "#555555",
+            "weight": 0.6,
+            "opacity": 0.7,
+            "fillOpacity": 0.85 if val is not None else 0.1,
+        }
+
+    tooltip = GeoJsonTooltip(
+        fields=[NAME_FIELD, "STATE_CSV", "NET_DISPLAY"],
+        aliases=["GeoJSON name:", "CSV name(s):", f"Net ({'MtCO₂e' if mt else 'tCO₂e'}):"],
+        localize=True, sticky=False, labels=True,
+        style=("background-color: white; color: #333; font-family: arial; "
+               "font-size: 12px; padding: 8px; border-radius: 6px;")
+    )
+
+    popup = GeoJsonPopup(
+        fields=[NAME_FIELD, "NET_DISPLAY", "IIP", "AFOLU", "WASTE",
+                "VEHICLE_COUNT", "TOTAL_POPULATION", "NSDP_2024_25", "STATE_CSV"],
+        aliases=["State:", f"Net ({'MtCO₂e' if mt else 'tCO₂e'}):", "IIP:", "AFOLU:",
+                 "WASTE:", "Vehicles:", "Population:", "NSDP 2024–25 (₹):", "CSV name(s):"],
+        localize=True, labels=True, parse_html=False, max_width=360,
+    )
+
+    folium.GeoJson(
+        gj_aug, name="Net Emissions", style_function=style_fn,
+        tooltip=tooltip, popup=popup,
+        highlight_function=lambda f: {"weight": 2.5, "color": "#000", "fillOpacity": 0.9},
+    ).add_to(m)
+
+    colormap.add_to(m)
+    folium.LayerControl(collapsed=True).add_to(m)
+    return m
+
 # ---------- UI ----------
 st.set_page_config(page_title="GHG Predictor", layout="wide")
 st.markdown(
@@ -155,6 +280,7 @@ with left:
     model_choice = st.radio("Model", ["RandomForest", "XGBoost"], horizontal=True, index=1)
     model, encoder, feat_ord = load_bundle(model_choice)
 
+    states = sorted(raw_df["STATE"].unique().tolist())
     st_state = st.selectbox("State", states,
                             index=states.index("ANDHRA PRADESH") if "ANDHRA PRADESH" in states else 0)
     st_year  = int(st.number_input("Year", min_value=1900, max_value=2100, value=2015, step=1))
@@ -165,7 +291,6 @@ with left:
     net_emission = iip + afolu + waste
     afolu_source = max(afolu, 0.0); afolu_sink = -min(afolu, 0.0)
 
-    # YoY box
     prev_iip, prev_afolu, prev_waste, _, _, _ = predict_with_fallback(
         st_state, max(st_year - 1, 1900), model, encoder, feat_ord
     )
@@ -208,15 +333,16 @@ with left:
 with right:
     tabs = st.tabs(["India Map", "Sector Share", "History 2005–2018", "Details"])
 
-    # ===== India Map (fixed matching using exact-case NAME_1) =====
+    # ===== India Map (Folium only; embed HTML to avoid reruns on zoom) =====
     with tabs[0]:
         st.markdown(f"**State-wise predictions for {st_year}**")
+
         with st.spinner("Computing predictions across states..."):
             rows = []
             for s in states:
                 i, a, w, v, p, n = predict_with_fallback(s, st_year, model, encoder, feat_ord)
                 net = i + a + w
-                gj_name_exact = to_gj_exact_case(s)  # <-- exact case from geojson
+                gj_name_exact = to_gj_exact_case(s)  # exact-case name from GeoJSON or None
                 rows.append({
                     "STATE": s,
                     "GJ_NAME_EXACT": gj_name_exact,
@@ -225,41 +351,35 @@ with right:
                     "NET": net
                 })
 
-        df_pred = pd.DataFrame(rows).dropna(subset=["GJ_NAME_EXACT"]).copy()
-        df_pred["NET_DISPLAY"] = df_pred["NET"] / (1e6 if mt else 1.0)
+        df_pred_all = pd.DataFrame(rows)
+        df_pred     = df_pred_all.dropna(subset=["GJ_NAME_EXACT"]).copy()
+
+        # Diagnostics: unmatched CSV states (helps patch aliases quickly)
+        unmatched = sorted(df_pred_all.loc[df_pred_all.GJ_NAME_EXACT.isna(), "STATE"].unique().tolist())
+        if unmatched:
+            st.warning("Unmatched CSV state names (not found in GeoJSON after aliasing): " + ", ".join(unmatched))
+            if "TELANGANA" in unmatched:
+                st.info("Note: TELANGANA is merged into ANDHRA PRADESH (older GeoJSONs often lack a separate Telangana).")
+
+        # Diagnostics: show which CSV states collapsed into same polygon
+        dups = df_pred[df_pred.duplicated("GJ_NAME_EXACT", keep=False)]
+        if not dups.empty:
+            merged = (dups.groupby("GJ_NAME_EXACT")["STATE"]
+                      .apply(lambda s: ", ".join(sorted(set(s)))).to_dict())
+            st.info("Merged multiple CSV states into one polygon:\n" +
+                    "\n".join([f"• {k}: {v}" for k, v in merged.items()]))
 
         if df_pred.empty:
-            st.warning("No states matched the GeoJSON names. Check alias mapping.")
+            st.error("No states matched the GeoJSON names. Check alias mapping / choose a newer GeoJSON.")
         else:
-            fig_map = px.choropleth(
-                df_pred,
-                geojson=gj,
-                locations="GJ_NAME_EXACT",                  # exact-case strings
-                featureidkey="properties.NAME_1",           # exact-key in geojson
-                color="NET_DISPLAY",
-                color_continuous_scale="YlOrRd",
-                hover_name="STATE",
-                hover_data={
-                    "NET_DISPLAY": (":,.2f" if mt else ":,.0f"),
-                    "IIP": ":,.0f",
-                    "AFOLU": ":,.0f",
-                    "WASTE": ":,.0f",
-                    "VEHICLE_COUNT": ":,.0f",
-                    "TOTAL_POPULATION": ":,.0f",
-                    "NSDP_2024_25": ":,.0f",
-                    "GJ_NAME_EXACT": False
-                },
-            )
-            fig_map.update_geos(fitbounds="locations", visible=False)
-            fig_map.update_layout(
-                height=560,
-                margin=dict(l=10, r=10, t=10, b=10),
-                coloraxis_colorbar=dict(title=f"Net ({'MtCO₂e' if mt else 'tCO₂e'})")
-            )
-            st.plotly_chart(fig_map, use_container_width=True)
+            m = build_folium_map(df_pred, unit, mt)  # <-- uses aggregated data internally
+            st_html(m.get_root().render(), height=560)
 
     # --- Sector Share ---
     with tabs[1]:
+        afolu_source = max(afolu, 0.0)
+        afolu_sink   = -min(afolu, 0.0)
+
         pie_vals, pie_labels = [], []
         if iip > 0:           pie_vals.append(iip);          pie_labels.append("IIP")
         if afolu_source > 0:  pie_vals.append(afolu_source); pie_labels.append("AFOLU")
@@ -268,13 +388,13 @@ with right:
         if len(pie_vals) == 0:
             st.info("No positive emission sources for this selection.")
             if afolu_sink > 0:
-                st.success(f"AFOLU sink: {fmt(afolu_sink, mt)} {unit}")
+                st.success(f"AFOLU sink: {fmt(afolu_sink, mt)} {('MtCO₂e' if mt else 'tCO₂e')}")
         else:
             vals = [v/1e6 if mt else v for v in pie_vals]
             fig = go.Figure(data=[go.Pie(labels=pie_labels, values=vals, hole=0.35)])
-            title = f"{st_state} {st_year} – Share of Positive Sources ({unit})"
+            title = f"{st_state} {st_year} – Share of Positive Sources ({'MtCO₂e' if mt else 'tCO₂e'})"
             if afolu_sink > 0:
-                title += f"  |  AFOLU sink: {fmt(afolu_sink, mt)} {unit}"
+                title += f"  |  AFOLU sink: {fmt(afolu_sink, mt)} {('MtCO₂e' if mt else 'tCO₂e')}"
             fig.update_layout(
                 title={"text": title, "x": 0.5, "xanchor": "center", "font": {"size": 18}},
                 height=430, margin=dict(l=10, r=10, t=70, b=10),
@@ -288,6 +408,8 @@ with right:
         hist_iip   = hist(raw_df, "IIP",   st_state)
         hist_afolu = hist(raw_df, "AFOLU", st_state)
         hist_waste = hist(raw_df, "WASTE", st_state)
+
+        mt_unit = ('MtCO₂e' if mt else 'tCO₂e')
 
         y_iip   = [v/1e6 if mt and pd.notna(v) else (v if pd.notna(v) else None) for v in hist_iip]
         y_afolu = [v/1e6 if mt and pd.notna(v) else (v if pd.notna(v) else None) for v in hist_afolu]
@@ -305,10 +427,10 @@ with right:
         fig.add_trace(go.Scatter(x=[st_year], y=[(waste/1e6 if mt else waste)],
                                  mode="markers", name="WASTE (pred)", marker=dict(size=12)))
         fig.update_layout(
-            title={"text": f"{st_state} – History (2005–2018) + Predicted Point ({unit})",
+            title={"text": f"{st_state} – History (2005–2018) + Predicted Point ({mt_unit})",
                    "x": 0.5, "xanchor": "center", "font": {"size": 18}},
             height=430, margin=dict(l=10, r=10, t=70, b=10),
-            xaxis_title="Year", yaxis_title=f"Emission ({unit})",
+            xaxis_title="Year", yaxis_title=f"Emission ({mt_unit})",
             legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0.5, xanchor="center"),
         )
         st.plotly_chart(fig, use_container_width=True)
@@ -319,15 +441,15 @@ with right:
             "Metric": ["IIP", "AFOLU (negative = sink)", "WASTE",
                        "Vehicle Count", "Population", "NSDP 2024–25", "Net Emission"],
             "Value": [
-                f"{fmt(iip, mt)} {unit}",
-                f"{fmt(afolu, mt)} {unit}",
-                f"{fmt(waste, mt)} {unit}",
+                f"{fmt(iip, mt)} {('MtCO₂e' if mt else 'tCO₂e')}",
+                f"{fmt(afolu, mt)} {('MtCO₂e' if mt else 'tCO₂e')}",
+                f"{fmt(waste, mt)} {('MtCO₂e' if mt else 'tCO₂e')}",
                 f"{int(veh):,}",
                 f"{int(pop):,}",
                 f"₹ {nsdp:,.0f}",
-                f"{fmt(net_emission, mt)} {unit}",
+                f"{fmt(iip + afolu + waste, mt)} {('MtCO₂e' if mt else 'tCO₂e')}",
             ]
         })
         st.dataframe(df_show, use_container_width=True)
 
-st.caption("• AFOLU can be negative (sink). • RF/XGB predict within 2005–2018; linear-trend fallback extrapolates outside. • Map uses india_state.geojson and shows state-wise net emissions for the selected year.")
+st.caption("• Aggregates duplicate matches (e.g., Telangana→AP) to avoid index errors. • Robust name matching (auto-detect NAME_1/st_nm + VARNAME_1). • Folium embedded as HTML so zoom/pan doesn’t rerun the app.")
